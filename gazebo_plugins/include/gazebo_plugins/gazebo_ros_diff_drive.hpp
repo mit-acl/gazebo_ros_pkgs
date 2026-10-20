@@ -77,6 +77,18 @@ class GazeboRosDiffDrivePrivate;
       <max_wheel_torque>20</max_wheel_torque>
       <max_wheel_acceleration>1.0</max_wheel_acceleration>
 
+      <!-- optional limits on the commanded twist, as a robot base's motor controller
+           applies them (each 0 = off, the default): speeds are clamped, the forward speed
+           is slewed (deceleration defaults to the acceleration), the yaw rate is not -->
+      <max_linear_velocity>1.2</max_linear_velocity>
+      <max_angular_velocity>6.0</max_angular_velocity>
+      <max_linear_acceleration>1.5</max_linear_acceleration>
+      <max_linear_deceleration>1.5</max_linear_deceleration>
+
+      <!-- optional: stop (forward speed through the deceleration limit) when no command
+           arrived for this many seconds; 0 = off, the default -->
+      <command_timeout>0.5</command_timeout>
+
       <!-- input -->
       <command_topic>cmd_vel</command_topic>
 

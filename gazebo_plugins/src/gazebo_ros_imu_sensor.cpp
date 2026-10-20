@@ -129,10 +129,12 @@ void GazeboRosImuSensorPrivate::OnUpdate()
   IGN_PROFILE("GazeboRosImuSensorPrivate::OnUpdate");
   IGN_PROFILE_BEGIN("fill ROS message");
 #endif
-  // Fill message with latest sensor data
-  // msg_->header.stamp = gazebo_ros::Convert<builtin_interfaces::msg::Time>(
-  //   sensor_->LastUpdateTime());
-  msg_->header.stamp = ros_node_->now();
+  // Fill message with latest sensor data. Stamp with the sim time of this
+  // update, not ros_node_->now(): the node is forced onto use_sim_time and
+  // /clock is published at 10 Hz by default, so now() would give ~20
+  // consecutive 200 Hz samples the same stamp.
+  msg_->header.stamp = gazebo_ros::Convert<builtin_interfaces::msg::Time>(
+    sensor_->LastUpdateTime());
   msg_->orientation =
     gazebo_ros::Convert<geometry_msgs::msg::Quaternion>(sensor_->Orientation());
   msg_->angular_velocity = gazebo_ros::Convert<geometry_msgs::msg::Vector3>(

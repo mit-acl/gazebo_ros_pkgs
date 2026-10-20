@@ -55,6 +55,7 @@
 #include <gazebo/physics/Link.hh>
 #include <gazebo/physics/Model.hh>
 #include <gazebo/physics/World.hh>
+#include <ignition/math/Helpers.hh>
 #include <gazebo_plugins/gazebo_ros_diff_drive.hpp>
 #include <gazebo_ros/conversions/builtin_interfaces.hpp>
 #include <gazebo_ros/conversions/geometry_msgs.hpp>
@@ -77,6 +78,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -114,8 +116,10 @@ public:
   /// \param[in] _msg Twist command message.
   void OnCmdVel(const geometry_msgs::msg::Twist::SharedPtr _msg);
 
-  /// Update wheel velocities according to latest target velocities.
-  void UpdateWheelVelocities();
+  /// Update the wheel speed targets from the latest command.
+  /// \param[in] _current_time Current simulation time
+  /// \param[in] _dt Seconds since the last update
+  void UpdateWheelVelocities(const gazebo::common::Time & _current_time, double _dt);
 
   /// Update odometry according to encoder.
   /// \param[in] _current_time Current simulation time
@@ -159,6 +163,22 @@ public:
 
   /// Maximum wheel acceleration
   double max_wheel_accel_;
+
+  /// Limits on the commanded body twist; 0 disables each.
+  double max_linear_vel_{0.0};
+  double max_angular_vel_{0.0};
+  double max_linear_accel_{0.0};
+  double max_linear_decel_{0.0};
+
+  /// Seconds without a command after which the robot stops; 0 disables.
+  double command_timeout_{0.0};
+
+  /// Sim time of the last command, and whether one arrived since the last update.
+  gazebo::common::Time last_cmd_time_;
+  bool cmd_received_{false};
+
+  /// Forward speed command after the linear acceleration limits (m/s).
+  double linear_filt_{0.0};
 
   /// Desired wheel speed.
   std::vector<double> desired_wheel_speed_;
@@ -257,6 +277,28 @@ void GazeboRosDiffDrive::Load(gazebo::physics::ModelPtr _model, sdf::ElementPtr 
   impl_->max_wheel_accel_ = _sdf->Get<double>("max_wheel_acceleration", 0.0).first;
   impl_->max_wheel_torque_ = _sdf->Get<double>("max_wheel_torque", 5.0).first;
 
+  // Limits on the commanded twist, as a robot base's motor controller applies them. Each is
+  // off at 0 (the default). Speeds are clamped; the forward speed is slewed from its own
+  // previous value, by max_linear_acceleration while it increases and
+  // max_linear_deceleration (default: the same) while it decreases; the yaw rate is not.
+  impl_->max_linear_vel_ = _sdf->Get<double>("max_linear_velocity", 0.0).first;
+  impl_->max_angular_vel_ = _sdf->Get<double>("max_angular_velocity", 0.0).first;
+  impl_->max_linear_accel_ = _sdf->Get<double>("max_linear_acceleration", 0.0).first;
+  impl_->max_linear_decel_ =
+    _sdf->Get<double>("max_linear_deceleration", impl_->max_linear_accel_).first;
+  // Command watchdog: with no command for this long, the target twist goes to zero (the
+  // forward speed through the deceleration limit) until the next command arrives.
+  impl_->command_timeout_ = _sdf->Get<double>("command_timeout", 0.0).first;
+  if (impl_->max_linear_vel_ > 0 || impl_->max_angular_vel_ > 0 ||
+    impl_->max_linear_accel_ > 0 || impl_->max_linear_decel_ > 0 || impl_->command_timeout_ > 0)
+  {
+    RCLCPP_INFO(
+      impl_->ros_node_->get_logger(),
+      "Command limits: |v| %g m/s, |w| %g rad/s, dv/dt +%g/-%g m/s^2, timeout %g s (0: none)",
+      impl_->max_linear_vel_, impl_->max_angular_vel_, impl_->max_linear_accel_,
+      impl_->max_linear_decel_, impl_->command_timeout_);
+  }
+
   // Get joints and Kinematic properties
   std::vector<gazebo::physics::JointPtr> left_joints, right_joints;
 
@@ -349,6 +391,7 @@ void GazeboRosDiffDrive::Load(gazebo::physics::ModelPtr _model, sdf::ElementPtr 
     impl_->update_period_ = 0.0;
   }
   impl_->last_update_time_ = _model->GetWorld()->SimTime();
+  impl_->last_cmd_time_ = impl_->last_update_time_;
 
   impl_->cmd_vel_sub_ = impl_->ros_node_->create_subscription<geometry_msgs::msg::Twist>(
     "cmd_vel", qos.get_subscription_qos("cmd_vel", rclcpp::QoS(1)),
@@ -427,8 +470,13 @@ void GazeboRosDiffDrive::Reset()
   impl_->pose_encoder_.x = 0;
   impl_->pose_encoder_.y = 0;
   impl_->pose_encoder_.theta = 0;
+  std::lock_guard<std::mutex> scoped_lock(impl_->lock_);
   impl_->target_x_ = 0;
   impl_->target_rot_ = 0;
+  impl_->cmd_received_ = false;
+  impl_->last_cmd_time_ = impl_->last_update_time_;
+  impl_->linear_filt_ = 0;
+  impl_->wheel_speed_instr_.assign(impl_->wheel_speed_instr_.size(), 0);
 }
 
 void GazeboRosDiffDrivePrivate::OnUpdate(const gazebo::common::UpdateInfo & _info)
@@ -480,66 +528,58 @@ void GazeboRosDiffDrivePrivate::OnUpdate(const gazebo::common::UpdateInfo & _inf
   IGN_PROFILE_BEGIN("UpdateWheelVelocities");
 #endif
   // Update robot in case new velocities have been requested
-  UpdateWheelVelocities();
+  UpdateWheelVelocities(_info.simTime, seconds_since_last_update);
 #ifdef IGN_PROFILER_ENABLE
   IGN_PROFILE_END();
 #endif
-  // Current speed
-  std::vector<double> current_speed(2 * num_wheel_pairs_);
-  for (unsigned int i = 0; i < num_wheel_pairs_; ++i) {
-    current_speed[2 * i + LEFT] =
-      joints_[2 * i + LEFT]->GetVelocity(0) * (wheel_diameter_[i] / 2.0);
-    current_speed[2 * i + RIGHT] =
-      joints_[2 * i + RIGHT]->GetVelocity(0) * (wheel_diameter_[i] / 2.0);
-  }
-
-  // If max_accel == 0, or target speed is reached
-  for (unsigned int i = 0; i < num_wheel_pairs_; ++i) {
-    if (max_wheel_accel_ == 0 ||
-      ((fabs(desired_wheel_speed_[2 * i + LEFT] - current_speed[2 * i + LEFT]) < 0.01) &&
-      (fabs(desired_wheel_speed_[2 * i + RIGHT] - current_speed[2 * i + RIGHT]) < 0.01)))
-    {
-      joints_[2 * i + LEFT]->SetParam(
-        "vel", 0, desired_wheel_speed_[2 * i + LEFT] / (wheel_diameter_[i] / 2.0));
-      joints_[2 * i + RIGHT]->SetParam(
-        "vel", 0, desired_wheel_speed_[2 * i + RIGHT] / (wheel_diameter_[i] / 2.0));
+  // The ramp limits each wheel's commanded speed from its own previous value, so the
+  // command is continuous whatever the measured speed does.
+  const double max_step = max_wheel_accel_ * seconds_since_last_update;
+  for (unsigned int i = 0; i < 2 * num_wheel_pairs_; ++i) {
+    if (max_wheel_accel_ > 0) {
+      wheel_speed_instr_[i] += ignition::math::clamp(
+        desired_wheel_speed_[i] - wheel_speed_instr_[i], -max_step, max_step);
     } else {
-      if (desired_wheel_speed_[2 * i + LEFT] >= current_speed[2 * i + LEFT]) {
-        wheel_speed_instr_[2 * i + LEFT] += fmin(
-          desired_wheel_speed_[2 * i + LEFT] -
-          current_speed[2 * i + LEFT], max_wheel_accel_ * seconds_since_last_update);
-      } else {
-        wheel_speed_instr_[2 * i + LEFT] += fmax(
-          desired_wheel_speed_[2 * i + LEFT] -
-          current_speed[2 * i + LEFT], -max_wheel_accel_ * seconds_since_last_update);
-      }
-
-      if (desired_wheel_speed_[2 * i + RIGHT] > current_speed[2 * i + RIGHT]) {
-        wheel_speed_instr_[2 * i + RIGHT] += fmin(
-          desired_wheel_speed_[2 * i + RIGHT] -
-          current_speed[2 * i + RIGHT], max_wheel_accel_ * seconds_since_last_update);
-      } else {
-        wheel_speed_instr_[2 * i + RIGHT] += fmax(
-          desired_wheel_speed_[2 * i + RIGHT] -
-          current_speed[2 * i + RIGHT], -max_wheel_accel_ * seconds_since_last_update);
-      }
-
-      joints_[2 * i + LEFT]->SetParam(
-        "vel", 0, wheel_speed_instr_[2 * i + LEFT] / (wheel_diameter_[i] / 2.0));
-      joints_[2 * i + RIGHT]->SetParam(
-        "vel", 0, wheel_speed_instr_[2 * i + RIGHT] / (wheel_diameter_[i] / 2.0));
+      wheel_speed_instr_[i] = desired_wheel_speed_[i];
     }
+    joints_[i]->SetParam("vel", 0, wheel_speed_instr_[i] / (wheel_diameter_[i / 2] / 2.0));
   }
 
   last_update_time_ = _info.simTime;
 }
 
-void GazeboRosDiffDrivePrivate::UpdateWheelVelocities()
+void GazeboRosDiffDrivePrivate::UpdateWheelVelocities(
+  const gazebo::common::Time & _current_time, double _dt)
 {
-  std::lock_guard<std::mutex> scoped_lock(lock_);
-
-  double vr = target_x_;
-  double va = target_rot_;
+  double vr, va;
+  {
+    std::lock_guard<std::mutex> scoped_lock(lock_);
+    if (cmd_received_) {
+      cmd_received_ = false;
+      last_cmd_time_ = _current_time;
+    }
+    if (command_timeout_ > 0 && (_current_time - last_cmd_time_).Double() >= command_timeout_) {
+      target_x_ = 0;
+      target_rot_ = 0;
+    }
+    vr = target_x_;
+    va = target_rot_;
+  }
+  if (max_linear_vel_ > 0) {
+    vr = ignition::math::clamp(vr, -max_linear_vel_, max_linear_vel_);
+  }
+  if (max_angular_vel_ > 0) {
+    va = ignition::math::clamp(va, -max_angular_vel_, max_angular_vel_);
+  }
+  if (max_linear_accel_ > 0 || max_linear_decel_ > 0) {
+    const double inf = std::numeric_limits<double>::infinity();
+    const double up = max_linear_accel_ > 0 ? max_linear_accel_ * _dt : inf;
+    const double down = max_linear_decel_ > 0 ? max_linear_decel_ * _dt : inf;
+    linear_filt_ += ignition::math::clamp(vr - linear_filt_, -down, up);
+    vr = linear_filt_;
+  } else {
+    linear_filt_ = vr;
+  }
 
   for (unsigned int i = 0; i < num_wheel_pairs_; ++i) {
     desired_wheel_speed_[2 * i + LEFT] = vr - va * wheel_separation_[i] / 2.0;
@@ -552,6 +592,7 @@ void GazeboRosDiffDrivePrivate::OnCmdVel(const geometry_msgs::msg::Twist::Shared
   std::lock_guard<std::mutex> scoped_lock(lock_);
   target_x_ = _msg->linear.x;
   target_rot_ = _msg->angular.z;
+  cmd_received_ = true;
 }
 
 void GazeboRosDiffDrivePrivate::UpdateOdometryEncoder(const gazebo::common::Time & _current_time)
